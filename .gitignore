@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+data/eia_raw.xlsx
+.DS_Store
