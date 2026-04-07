@@ -83,15 +83,21 @@ def fetch_sheet(name):
         try:
             r = requests.get(url, timeout=30)
             if r.status_code == 200 and len(r.text) > 10:
-                reader = csv.reader(io.StringIO(r.text))
-                headers = [h.strip().strip('"') for h in next(reader)]
+                # Use csv.reader on the full text — it correctly handles
+                # quoted fields containing embedded newlines (e.g., long descriptions)
+                reader = csv.reader(io.StringIO(r.text), quotechar='"', skipinitialspace=True)
+                all_rows = list(reader)
+                if not all_rows:
+                    continue
+                headers = [h.strip().strip('"') for h in all_rows[0]]
                 rows = []
-                for row in reader:
+                for row in all_rows[1:]:
                     if len(row) >= 1 and row[0].strip():
                         rows.append({h: (row[i].strip() if i < len(row) else '') for i, h in enumerate(headers)})
-                print(f"  '{name}': {len(rows)} rows")
+                print(f"  '{name}': {len(rows)} rows, {len(headers)} cols")
                 return rows, headers
-        except Exception:
+        except Exception as e:
+            print(f"  Warning: {e}")
             continue
     print(f"  ERROR: Could not fetch '{name}'")
     return [], []
@@ -258,14 +264,24 @@ def fetch_eia():
 
                 print(f"    Sheet '{sheet_name}': header row {hrow}")
 
+                # Dump ALL header columns for diagnosis
+                all_headers = {}
+                for cc in range(1, ws.max_column + 1):
+                    v = ws.cell(row=hrow, column=cc).value
+                    if v is not None:
+                        all_headers[cc] = str(v).strip()
+                print(f"    All headers: {all_headers}")
+
                 # Map columns
                 cols = {}
-                for cc in range(1, ws.max_column + 1):
-                    v = str(ws.cell(row=hrow, column=cc).value or '').strip().lower()
+                for cc, hdr in all_headers.items():
+                    v = hdr.strip().lower()
                     if v == 'year': cols['year'] = cc
                     elif v == 'month': cols['month'] = cc
                     elif v == 'state': cols['state'] = cc
-                    elif 'industry sector' in v or v == 'sector':
+                    elif v == 'data status' or v == 'status':
+                        pass  # skip
+                    elif 'industry sector' in v or v == 'sector' or v == 'sectors' or 'sector category' in v:
                         cols['sector'] = cc
                     # Sales and revenue columns — names vary
                     elif 'residential' in v and 'sales' in v:
@@ -286,22 +302,31 @@ def fetch_eia():
                     elif v == 'revenue' or 'thousand dollars' in v or 'thousand_dollars' in v:
                         if 'revenue' not in cols: cols['revenue'] = cc
 
-                print(f"    Columns found: {cols}")
+                print(f"    Mapped columns: {cols}")
 
                 if 'year' not in cols or 'state' not in cols:
                     continue
 
-                # Determine format: wide (separate cols per sector) vs long (sector column)
+                # Determine format: wide (separate cols per sector), long (sector column),
+                # or simple (just total revenue+sales without sector breakdown)
                 has_wide = 'res_sales' in cols and 'res_rev' in cols
                 has_long = 'sector' in cols and 'sales' in cols and 'revenue' in cols
+                has_simple = 'sales' in cols and 'revenue' in cols and not has_long
 
-                if not has_wide and not has_long:
-                    print(f"    Neither wide nor long format detected")
+                # Skip YTD/annual sheets if we want monthly granularity
+                is_monthly = 'month' in cols
+                if not is_monthly:
+                    print(f"    Skipping non-monthly sheet")
+                    continue
+
+                if not has_wide and not has_long and not has_simple:
+                    print(f"    No usable sales/revenue columns found")
                     continue
 
                 # Parse data rows
                 result = {}  # state -> (year, month) -> {sec: cents/kWh}
                 latest_ym = (1990, 1)
+                row_count = 0
 
                 for rr in range(hrow + 1, ws.max_row + 1):
                     yr = safe_int(ws.cell(row=rr, column=cols['year']).value)
@@ -352,6 +377,7 @@ def fetch_eia():
                                 cents_per_kwh = (rev * 100) / sales
                                 if 0 < cents_per_kwh < 100:  # sanity check
                                     result[state_name][ym][sec] = cents_per_kwh
+                                    row_count += 1
 
                     elif has_long:
                         # Long format: sector column + single sales/revenue
@@ -363,16 +389,40 @@ def fetch_eia():
                             if 0 < cents_per_kwh < 100:
                                 if sec_str.startswith('res'):
                                     result[state_name][ym]['res'] = cents_per_kwh
+                                    row_count += 1
                                 elif sec_str.startswith('com'):
                                     result[state_name][ym]['com'] = cents_per_kwh
+                                    row_count += 1
                                 elif sec_str.startswith('ind'):
                                     result[state_name][ym]['ind'] = cents_per_kwh
+                                    row_count += 1
+
+                    elif has_simple:
+                        # Simple format: total revenue + total sales, no sector breakdown
+                        # Compute the all-sector average and assign to all three sectors
+                        # (with a note in the data so the map can label it as "all-sector avg")
+                        sales = safe_float(ws.cell(row=rr, column=cols['sales']).value)
+                        rev = safe_float(ws.cell(row=rr, column=cols['revenue']).value)
+                        if sales and rev and sales > 0:
+                            cents_per_kwh = (rev * 100) / sales
+                            if 0 < cents_per_kwh < 100:
+                                # Assign the same all-sector value to all three sectors
+                                # so the existing layer code works. We'll mark this as
+                                # 'all-sector average' in the hover text via a flag.
+                                result[state_name][ym]['res'] = cents_per_kwh
+                                result[state_name][ym]['com'] = cents_per_kwh
+                                result[state_name][ym]['ind'] = cents_per_kwh
+                                result[state_name][ym]['_all_sector'] = True
+                                row_count += 1
 
                 if result and len(result) > 10:
-                    print(f"    Parsed {len(result)} states, latest: {MONTH_NAMES[latest_ym[1]-1]} {latest_ym[0]}")
+                    print(f"    Parsed {len(result)} states, {row_count} state-month-sector combos")
+                    print(f"    Latest: {MONTH_NAMES[latest_ym[1]-1]} {latest_ym[0]}")
                     sample = next(iter(result.keys()))
                     sample_data = result[sample].get(latest_ym, {})
                     print(f"    Sample [{sample}] {MONTH_NAMES[latest_ym[1]-1]} {latest_ym[0]}: {sample_data}")
+                    if has_simple:
+                        print(f"    NOTE: Using all-sector average prices (no sector breakdown in this file)")
                     return result, latest_ym
 
         except Exception as e:
