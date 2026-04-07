@@ -73,34 +73,102 @@ def pct_change(cur, hist):
 # ═══════════════════════════════════════════
 # GOOGLE SHEETS
 # ═══════════════════════════════════════════
-def fetch_sheet(name):
+def fetch_sheet_xlsx_fallback(name):
+    """
+    Fallback: download the entire Google Sheet as XLSX and parse the named tab.
+    This avoids CSV multi-line cell issues entirely.
+    """
+    print(f"  XLSX fallback for '{name}'...")
+    import openpyxl
+    url = f"https://docs.google.com/spreadsheets/d/{GOOGLE_SHEET_ID}/export?format=xlsx"
+    try:
+        r = requests.get(url, timeout=60)
+        if r.status_code != 200:
+            print(f"    Status {r.status_code}")
+            return [], []
+        with open('data/gsheet_dump.xlsx', 'wb') as f:
+            f.write(r.content)
+        wb = openpyxl.load_workbook('data/gsheet_dump.xlsx', data_only=True)
+        if name not in wb.sheetnames:
+            print(f"    Tab '{name}' not in {wb.sheetnames}")
+            return [], []
+        ws = wb[name]
+        # First row = headers
+        headers = []
+        for c in range(1, ws.max_column + 1):
+            v = ws.cell(row=1, column=c).value
+            headers.append(str(v).strip() if v else '')
+        # Subsequent rows = data
+        rows = []
+        for r_idx in range(2, ws.max_row + 1):
+            first_val = ws.cell(row=r_idx, column=1).value
+            if not first_val: continue
+            row_dict = {}
+            for c_idx, h in enumerate(headers, 1):
+                if not h: continue
+                v = ws.cell(row=r_idx, column=c_idx).value
+                row_dict[h] = str(v).strip() if v is not None else ''
+            rows.append(row_dict)
+        print(f"    XLSX fallback: {len(rows)} rows, {len(headers)} cols")
+        return rows, headers
+    except Exception as e:
+        print(f"    XLSX fallback error: {e}")
+        return [], []
+
+def fetch_sheet(name, debug=False):
     enc = requests.utils.quote(name)
+    # Try multiple URL patterns. The export?format=csv endpoint sometimes
+    # handles multi-line cells better than gviz.
     urls = [
         f"https://docs.google.com/spreadsheets/d/{GOOGLE_SHEET_ID}/gviz/tq?tqx=out:csv&sheet={enc}",
         f"https://docs.google.com/spreadsheets/d/{GOOGLE_SHEET_ID}/export?format=csv&sheet={enc}",
     ]
-    for url in urls:
+    for url_idx, url in enumerate(urls):
         try:
             r = requests.get(url, timeout=30)
-            if r.status_code == 200 and len(r.text) > 10:
-                # Use csv.reader on the full text — it correctly handles
-                # quoted fields containing embedded newlines (e.g., long descriptions)
-                reader = csv.reader(io.StringIO(r.text), quotechar='"', skipinitialspace=True)
-                all_rows = list(reader)
-                if not all_rows:
-                    continue
-                headers = [h.strip().strip('"') for h in all_rows[0]]
-                rows = []
-                for row in all_rows[1:]:
-                    if len(row) >= 1 and row[0].strip():
-                        rows.append({h: (row[i].strip() if i < len(row) else '') for i, h in enumerate(headers)})
-                print(f"  '{name}': {len(rows)} rows, {len(headers)} cols")
-                return rows, headers
+            if r.status_code != 200 or len(r.text) < 10:
+                continue
+
+            text = r.text
+
+            if debug:
+                print(f"  DEBUG: URL {url_idx}: {len(text)} bytes")
+                print(f"  DEBUG: First 300 chars: {text[:300]!r}")
+                print(f"  DEBUG: Number of newlines: {text.count(chr(10))}")
+                print(f"  DEBUG: Number of carriage returns: {text.count(chr(13))}")
+
+            # Use csv.reader on the full text — it correctly handles
+            # quoted fields containing embedded newlines (e.g., long descriptions)
+            reader = csv.reader(io.StringIO(text), quotechar='"', skipinitialspace=True)
+            all_rows = list(reader)
+            if not all_rows:
+                continue
+
+            headers = [h.strip().strip('"') for h in all_rows[0]]
+            rows = []
+            for row in all_rows[1:]:
+                if len(row) >= 1 and row[0].strip():
+                    rows.append({h: (row[i].strip() if i < len(row) else '') for i, h in enumerate(headers)})
+
+            print(f"  '{name}': {len(rows)} rows, {len(headers)} cols (URL {url_idx})")
+
+            # If we got too few rows, try XLSX fallback
+            if len(rows) < 5:
+                print(f"    Too few rows from CSV, trying XLSX fallback...")
+                xlsx_rows, xlsx_headers = fetch_sheet_xlsx_fallback(name)
+                if len(xlsx_rows) >= 5:
+                    return xlsx_rows, xlsx_headers
+                # Continue to next URL if XLSX also fails
+                continue
+
+            return rows, headers
         except Exception as e:
-            print(f"  Warning: {e}")
+            print(f"  Warning ({url_idx}): {e}")
             continue
-    print(f"  ERROR: Could not fetch '{name}'")
-    return [], []
+
+    # Last resort: XLSX fallback
+    print(f"  All CSV URLs failed for '{name}', trying XLSX fallback")
+    return fetch_sheet_xlsx_fallback(name)
 
 def read_dc_history(rows, headers):
     month_cols = {}
@@ -630,7 +698,7 @@ def main():
     print("\n--- Google Sheet ---")
     dc_rows, dc_h = fetch_sheet('State DC History')
     dc_hist, lat_dc = read_dc_history(dc_rows, dc_h)
-    tax_rows, tax_h = fetch_sheet('State Tax Incentive')
+    tax_rows, tax_h = fetch_sheet('State Tax Incentive', debug=True)
     tax = read_tax(tax_rows, tax_h)
     reg_rows, reg_h = fetch_sheet('Total Regulations')
     regs = read_regs(reg_rows, reg_h)
