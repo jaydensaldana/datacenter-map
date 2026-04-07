@@ -33,3 +33,4 @@ jobs:
         with:
           commit_message: "Auto-update: data refresh"
           file_pattern: "data/* index.html"
+          push_options: '--force'
